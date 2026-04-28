@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.db
+*.sqlite
+storage/uploads/
+storage/pages/
+storage/crops/
+.DS_Store
