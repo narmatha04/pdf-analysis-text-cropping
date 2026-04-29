@@ -1,11 +1,11 @@
 import json
 import os
 
-import google.generativeai as genai
+from google import genai
 
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
-_FLASH = "gemini-2.0-flash"
+_MODEL = "models/gemini-2.5-flash"
 
 TOPICS = [
     "Relations & Functions", "Inverse Trigonometry", "Matrices", "Determinants",
@@ -63,6 +63,8 @@ Output ONLY valid JSON:
   ]
 }}"""
 
-    model = genai.GenerativeModel(_FLASH)
-    response = model.generate_content(prompt)
+    response = client.models.generate_content(
+        model=_MODEL,
+        contents=prompt,
+    )
     return json.loads(response.text.strip())

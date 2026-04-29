@@ -5,13 +5,12 @@ import os
 import re
 from pathlib import Path
 
-import google.generativeai as genai
+from google import genai
 from PIL import Image
 
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
-# gemini-2.0-flash: free tier, vision-capable, fast
-_FLASH = "gemini-2.0-flash"
+_MODEL = "models/gemini-2.5-flash"
 
 
 def _load_image(path: str) -> Image.Image:
@@ -20,13 +19,11 @@ def _load_image(path: str) -> Image.Image:
 
 def _parse_json(text: str) -> dict | list:
     text = text.strip()
-    # strip markdown code fences if present
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # fallback: grab outermost { } or [ ]
         m = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
         if m:
             return json.loads(m.group(1))
@@ -37,9 +34,7 @@ def extract_marks_grid(page1_image_path: str) -> dict:
     """
     Read the printed marks table on the cover page.
     Returns {"marks": {"1": 0, "2": 1, ...}, "total": 34, "student_name": "..."}
-    Marks may be 0, 0.5, 1, 2, 3, 4, 5 or null (not attempted).
     """
-    model = genai.GenerativeModel(_FLASH)
     img = _load_image(page1_image_path)
 
     prompt = (
@@ -55,20 +50,16 @@ def extract_marks_grid(page1_image_path: str) -> dict:
         '{"marks": {"1": 0, "2": 1, ...}, "total": 34, "student_name": null}'
     )
 
-    response = model.generate_content([img, prompt])
+    response = client.models.generate_content(
+        model=_MODEL,
+        contents=[img, prompt],
+    )
     return _parse_json(response.text)
 
 
 def segment_page(page_image_path: str, page_number: int) -> list[dict]:
     """
     Identify every question on a page and return bounding boxes.
-
-    Based on the actual paper structure:
-    - Ruled lined paper, single column
-    - Question numbers handwritten in left margin (may be circled or have parentheses)
-    - Blue/black student ink; red evaluator marks (ignore red)
-    - Some pages have 2D matrix notation spreading horizontally
-    - Last pages may be supplementary sheets
 
     Returns list of:
     {
@@ -77,10 +68,9 @@ def segment_page(page_image_path: str, page_number: int) -> list[dict]:
       "answer_text": "...",
       "has_worked_steps": true,
       "confidence": "high" | "medium" | "low",
-      "is_continuation": false      # true if this is continuation of prev page's answer
+      "is_continuation": false
     }
     """
-    model = genai.GenerativeModel(_FLASH)
     img = _load_image(page_image_path)
 
     prompt = (
@@ -109,18 +99,19 @@ def segment_page(page_image_path: str, page_number: int) -> list[dict]:
         "]}"
     )
 
-    response = model.generate_content([img, prompt])
+    response = client.models.generate_content(
+        model=_MODEL,
+        contents=[img, prompt],
+    )
     raw = _parse_json(response.text)
     return raw.get("questions", [])
 
 
 def check_page_boundary(page_a_path: str, page_b_path: str, page_a_number: int) -> dict | None:
     """
-    Send both pages to detect if an answer continues across them.
-    Returns {"question_id": 28, "continues_on_next": true} or None.
-    Only called when segmentation flags a continuation.
+    Detect if an answer continues across two pages.
+    Returns {"question_id": 28, "continues": true} or None.
     """
-    model = genai.GenerativeModel(_FLASH)
     img_a = _load_image(page_a_path)
     img_b = _load_image(page_b_path)
 
@@ -134,6 +125,9 @@ def check_page_boundary(page_a_path: str, page_b_path: str, page_a_number: int) 
         '{"continues": true, "question_id": 28} or {"continues": false}'
     )
 
-    response = model.generate_content([img_a, img_b, prompt])
+    response = client.models.generate_content(
+        model=_MODEL,
+        contents=[img_a, img_b, prompt],
+    )
     result = _parse_json(response.text)
     return result if result.get("continues") else None
