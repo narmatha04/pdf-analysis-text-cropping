@@ -41,7 +41,12 @@ def _run(submission: Submission, pdf_path: str, db: Session):
 
     # --- Phase 1: marks grid from page 1 ---
     marks_data = extract_marks_grid(image_paths[0])
-    marks = {int(k): v for k, v in marks_data.get("marks", {}).items()}
+    marks = {}
+    for k, v in marks_data.get("marks", {}).items():
+        try:
+            marks[int(k)] = v
+        except (TypeError, ValueError):
+            pass  # skip non-integer keys Gemini may hallucinate
     submission.total_marks = marks_data.get("total")
     submission.student_name = marks_data.get("student_name")
 
@@ -77,7 +82,14 @@ def _run(submission: Submission, pdf_path: str, db: Session):
 
     # --- Phase 4: store locations + transcriptions ---
     for seg in resolved:
-        q_num = seg["question_id"]
+        q_num = seg.get("question_id")
+        # Skip malformed segments where Gemini returned null question_id
+        if q_num is None:
+            continue
+        try:
+            q_num = int(q_num)
+        except (TypeError, ValueError):
+            continue
         if q_num not in question_map:
             # Question found in answer pages but not in marks grid — add it
             q = Question(
