@@ -14,11 +14,30 @@ def _padded(bbox: list[float]) -> list[float]:
     ]
 
 
+def _normalise(bbox: list[float], img_w: int, img_h: int) -> list[float]:
+    """
+    Ensure bbox is in 0-1 range.
+    Gemini occasionally returns pixel coordinates instead of normalised values.
+    Detect this by checking if any value exceeds 1.0 and divide by image dims.
+    """
+    x1, y1, x2, y2 = bbox
+    if x2 > 1.0 or y2 > 1.0:
+        x1, y1, x2, y2 = x1 / img_w, y1 / img_h, x2 / img_w, y2 / img_h
+    # Clamp to valid range
+    return [
+        max(0.0, min(1.0, x1)),
+        max(0.0, min(1.0, y1)),
+        max(0.0, min(1.0, x2)),
+        max(0.0, min(1.0, y2)),
+    ]
+
+
 def crop_image(page_image_path: str, bbox: list[float]) -> Image.Image:
     """Crop a normalised bbox from a page image with padding."""
     img = Image.open(page_image_path).convert("RGB")
     w, h = img.size
-    x1, y1, x2, y2 = _padded(bbox)
+    normalised = _normalise(bbox, w, h)
+    x1, y1, x2, y2 = _padded(normalised)
     return img.crop((int(x1 * w), int(y1 * h), int(x2 * w), int(y2 * h)))
 
 
