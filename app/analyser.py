@@ -1,7 +1,11 @@
 import json
-import anthropic
+import os
 
-client = anthropic.Anthropic()
+import google.generativeai as genai
+
+genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+
+_FLASH = "gemini-2.0-flash"
 
 TOPICS = [
     "Relations & Functions", "Inverse Trigonometry", "Matrices", "Determinants",
@@ -59,9 +63,6 @@ Output ONLY valid JSON:
   ]
 }}"""
 
-    response = client.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=2048,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return json.loads(response.content[0].text.strip())
+    model = genai.GenerativeModel(_FLASH)
+    response = model.generate_content(prompt)
+    return json.loads(response.text.strip())
