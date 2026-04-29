@@ -47,7 +47,8 @@ async def upload_pdf(
     db.commit()
 
     # Run pipeline in background — upload returns immediately
-    background_tasks.add_task(run_pipeline, sub_id, str(dest), db)
+    # NOTE: do NOT pass db here — background task must open its own session
+    background_tasks.add_task(run_pipeline, sub_id, str(dest))
 
     return {"submission_id": sub_id, "status": "processing"}
 

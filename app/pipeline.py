@@ -4,9 +4,7 @@ import json
 import shutil
 from pathlib import Path
 
-from sqlalchemy.orm import Session
-
-from .models import Submission, Question, QuestionLocation, Analysis
+from .models import Submission, Question, QuestionLocation, Analysis, SessionLocal
 from .pdf_utils import pdf_to_images
 from .extractor import extract_marks_grid, segment_page, check_page_boundary
 from .analyser import analyse_submission
@@ -14,19 +12,27 @@ from .analyser import analyse_submission
 STORAGE = Path(__file__).parent.parent / "storage"
 
 
-def run_pipeline(submission_id: str, pdf_path: str, db: Session):
-    submission = db.get(Submission, submission_id)
-    submission.status = "processing"
-    db.commit()
-
+def run_pipeline(submission_id: str, pdf_path: str):
+    # Background tasks must create their own DB session — never reuse the
+    # request-scoped session which is closed before this task runs.
+    db = SessionLocal()
     try:
+        submission = db.get(Submission, submission_id)
+        submission.status = "processing"
+        db.commit()
         _run(submission, pdf_path, db)
         submission.status = "done"
-    except Exception as e:
-        submission.status = "failed"
-        submission.error_message = str(e)
-    finally:
         db.commit()
+    except Exception as e:
+        db.rollback()
+        submission = db.get(Submission, submission_id)
+        if submission:
+            submission.status = "failed"
+            submission.error_message = str(e)
+            db.commit()
+        raise
+    finally:
+        db.close()
 
 
 def _run(submission: Submission, pdf_path: str, db: Session):
