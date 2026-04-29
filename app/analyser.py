@@ -1,5 +1,6 @@
 import json
 import os
+import re
 
 from google import genai
 
@@ -67,4 +68,16 @@ Output ONLY valid JSON:
         model=_MODEL,
         contents=prompt,
     )
-    return json.loads(response.text.strip())
+    text = (response.text or "").strip()
+    # Strip markdown fences if present
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    if not text:
+        return {}
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        m = re.search(r"(\{.*\})", text, re.DOTALL)
+        if m:
+            return json.loads(m.group(1))
+        return {}
