@@ -66,6 +66,8 @@ def _phase1_marks(submission: Submission, page1_path: str, db: Session):
     """
     Extract marks grid from cover page and seed question rows.
     SKIP if questions already exist for this submission (resume).
+    If no marks grid is found (e.g. PDF starts with answer pages),
+    seeds placeholder questions from the mark scheme and continues.
     """
     existing = db.query(Question).filter_by(submission_id=submission.id).count()
     if existing > 0:
@@ -73,7 +75,11 @@ def _phase1_marks(submission: Submission, page1_path: str, db: Session):
         return
 
     print("[pipeline] phase 1: extracting marks grid")
-    marks_data = extract_marks_grid(page1_path)
+    try:
+        marks_data = extract_marks_grid(page1_path)
+    except Exception as e:
+        print(f"[pipeline] phase 1 marks grid failed: {e} — seeding from mark scheme")
+        marks_data = {}
 
     marks = {}
     for k, v in marks_data.get("marks", {}).items():
@@ -85,16 +91,27 @@ def _phase1_marks(submission: Submission, page1_path: str, db: Session):
     submission.total_marks = marks_data.get("total")
     submission.student_name = marks_data.get("student_name")
 
-    for q_num, mark in marks.items():
-        db.add(Question(
-            submission_id=submission.id,
-            question_number=q_num,
-            marks_obtained=mark,
-            max_marks=_infer_max(q_num),
-        ))
+    if marks:
+        for q_num, mark in marks.items():
+            db.add(Question(
+                submission_id=submission.id,
+                question_number=q_num,
+                marks_obtained=mark,
+                max_marks=_infer_max(q_num),
+            ))
+        print(f"[pipeline] phase 1 done — {len(marks)} questions seeded from marks grid")
+    else:
+        # No cover page — seed all 36 questions from mark scheme, marks unknown
+        for q_num in range(1, 37):
+            db.add(Question(
+                submission_id=submission.id,
+                question_number=q_num,
+                marks_obtained=None,
+                max_marks=_infer_max(q_num),
+            ))
+        print("[pipeline] phase 1 done — no marks grid found, seeded 36 questions from mark scheme")
 
     db.commit()
-    print(f"[pipeline] phase 1 done — {len(marks)} questions seeded")
 
 
 # ── Phase 2: segmentation ─────────────────────────────────────────────────────
