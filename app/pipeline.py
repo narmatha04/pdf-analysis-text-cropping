@@ -13,12 +13,13 @@ from .analyser import analyse_submission
 STORAGE = Path(__file__).parent.parent / "storage"
 
 
-def run_pipeline(submission_id: str, pdf_path: str):
+def run_pipeline(submission_id: str, pdf_path: str, max_pages: int = None):
     """
     Entry point for background task.
     Creates its own DB session — never reuse the request-scoped session.
     Runs three independently committed phases so a failure at phase N
     doesn't require re-running phases 1..N-1.
+    max_pages: limit answer pages processed (None = all). Useful for testing.
     """
     db = SessionLocal()
     try:
@@ -29,8 +30,14 @@ def run_pipeline(submission_id: str, pdf_path: str):
         pages_dir = STORAGE / "pages" / submission_id
         image_paths = pdf_to_images(pdf_path, str(pages_dir), dpi=150)
 
+        # page 0 = cover (marks grid), pages 1..N = answer pages
+        answer_pages = image_paths[1:]
+        if max_pages:
+            answer_pages = answer_pages[:max_pages]
+            print(f"[pipeline] test mode — processing {max_pages} of {len(image_paths)-1} pages")
+
         _phase1_marks(submission, image_paths[0], db)
-        _phase2_segmentation(submission, image_paths[1:], db)
+        _phase2_segmentation(submission, answer_pages, db)
         _phase3_analysis(submission, db)
 
         submission.status = "done"

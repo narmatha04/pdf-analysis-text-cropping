@@ -33,6 +33,7 @@ async def upload_pdf(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
+    max_pages: int = None,  # e.g. ?max_pages=10 for testing
 ):
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files accepted")
@@ -48,7 +49,7 @@ async def upload_pdf(
 
     # Run pipeline in background — upload returns immediately
     # NOTE: do NOT pass db here — background task must open its own session
-    background_tasks.add_task(run_pipeline, sub_id, str(dest))
+    background_tasks.add_task(run_pipeline, sub_id, str(dest), max_pages)
 
     return {"submission_id": sub_id, "status": "processing"}
 
