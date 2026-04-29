@@ -1,78 +1,123 @@
 from __future__ import annotations
 
 import json
-import shutil
 from pathlib import Path
+
+from sqlalchemy.orm import Session
 
 from .models import Submission, Question, QuestionLocation, Analysis, SessionLocal
 from .pdf_utils import pdf_to_images
-from .extractor import extract_marks_grid, segment_page, check_page_boundary
+from .extractor import extract_marks_grid, segment_page
 from .analyser import analyse_submission
 
 STORAGE = Path(__file__).parent.parent / "storage"
 
 
 def run_pipeline(submission_id: str, pdf_path: str):
-    # Background tasks must create their own DB session — never reuse the
-    # request-scoped session which is closed before this task runs.
+    """
+    Entry point for background task.
+    Creates its own DB session — never reuse the request-scoped session.
+    Runs three independently committed phases so a failure at phase N
+    doesn't require re-running phases 1..N-1.
+    """
     db = SessionLocal()
     try:
         submission = db.get(Submission, submission_id)
         submission.status = "processing"
         db.commit()
-        _run(submission, pdf_path, db)
+
+        pages_dir = STORAGE / "pages" / submission_id
+        image_paths = pdf_to_images(pdf_path, str(pages_dir), dpi=150)
+
+        _phase1_marks(submission, image_paths[0], db)
+        _phase2_segmentation(submission, image_paths[1:], db)
+        _phase3_analysis(submission, db)
+
         submission.status = "done"
         db.commit()
+        print(f"[pipeline] submission {submission_id} complete")
+
     except Exception as e:
         db.rollback()
-        submission = db.get(Submission, submission_id)
-        if submission:
-            submission.status = "failed"
-            submission.error_message = str(e)
-            db.commit()
+        try:
+            submission = db.get(Submission, submission_id)
+            if submission:
+                submission.status = "failed"
+                submission.error_message = str(e)
+                db.commit()
+        except Exception:
+            pass
+        print(f"[pipeline] FAILED: {e}")
         raise
     finally:
         db.close()
 
 
-def _run(submission: Submission, pdf_path: str, db: Session):
-    pages_dir = STORAGE / "pages" / submission.id
-    image_paths = pdf_to_images(pdf_path, str(pages_dir), dpi=150)
+# ── Phase 1: marks grid ───────────────────────────────────────────────────────
 
-    # --- Phase 1: marks grid from page 1 ---
-    marks_data = extract_marks_grid(image_paths[0])
+def _phase1_marks(submission: Submission, page1_path: str, db: Session):
+    """
+    Extract marks grid from cover page and seed question rows.
+    SKIP if questions already exist for this submission (resume).
+    """
+    existing = db.query(Question).filter_by(submission_id=submission.id).count()
+    if existing > 0:
+        print(f"[pipeline] phase 1 already done ({existing} questions) — skipping")
+        return
+
+    print("[pipeline] phase 1: extracting marks grid")
+    marks_data = extract_marks_grid(page1_path)
+
     marks = {}
     for k, v in marks_data.get("marks", {}).items():
         try:
             marks[int(k)] = v
         except (TypeError, ValueError):
-            pass  # skip non-integer keys Gemini may hallucinate
+            pass
+
     submission.total_marks = marks_data.get("total")
     submission.student_name = marks_data.get("student_name")
 
-    # Seed question rows with marks — answer_text filled later
-    question_map: dict[int, Question] = {}
     for q_num, mark in marks.items():
-        q = Question(
+        db.add(Question(
             submission_id=submission.id,
             question_number=q_num,
             marks_obtained=mark,
             max_marks=_infer_max(q_num),
-        )
-        db.add(q)
-        question_map[q_num] = q
-    db.flush()
+        ))
 
-    # --- Phase 2: segmentation across all pages ---
-    # Skip page 1 (cover) — it has a few short answers at the bottom but
-    # the main answers start from page 2.
-    all_segments: list[dict] = []  # {page, question_id, bbox, answer_text, is_continuation}
+    db.commit()
+    print(f"[pipeline] phase 1 done — {len(marks)} questions seeded")
 
-    for page_idx, img_path in enumerate(image_paths[1:], start=2):
+
+# ── Phase 2: segmentation ─────────────────────────────────────────────────────
+
+def _phase2_segmentation(submission: Submission, answer_image_paths: list[str], db: Session):
+    """
+    Segment each answer page and store bounding boxes + transcriptions.
+    SKIP pages that already have locations stored (resume from last saved page).
+    """
+    # Build question map from DB
+    questions = db.query(Question).filter_by(submission_id=submission.id).all()
+    question_map: dict[int, Question] = {q.question_number: q for q in questions}
+
+    # Find which pages already have locations saved
+    done_pages: set[int] = set()
+    for q in questions:
+        for loc in q.locations:
+            done_pages.add(loc.page_number)
+
+    all_segments: list[dict] = []
+
+    for i, img_path in enumerate(answer_image_paths):
+        page_idx = i + 2  # pages are 1-indexed, page 1 is cover
+        if page_idx in done_pages:
+            print(f"[pipeline] page {page_idx} already segmented — skipping")
+            continue
         try:
             segments = segment_page(img_path, page_idx)
         except Exception as e:
-            print(f"[pipeline] page {page_idx} segmentation failed: {e} — skipping")
+            print(f"[pipeline] page {page_idx} failed: {e} — skipping")
             segments = []
         for seg in segments:
             seg["page"] = page_idx
@@ -80,23 +125,20 @@ def _run(submission: Submission, pdf_path: str, db: Session):
         all_segments.extend(segments)
         print(f"[pipeline] page {page_idx} done — {len(segments)} questions found")
 
-    # --- Phase 3: resolve multi-page continuations ---
-    # If VLM flagged is_continuation=true on a segment, check the boundary
-    # and merge it into the previous question.
-    resolved = _resolve_continuations(all_segments, image_paths)
+    # Resolve continuations
+    resolved = _resolve_continuations(all_segments)
 
-    # --- Phase 4: store locations + transcriptions ---
+    # Store locations and transcriptions
     for seg in resolved:
         q_num = seg.get("question_id")
-        # Skip malformed segments where Gemini returned null question_id
         if q_num is None:
             continue
         try:
             q_num = int(q_num)
         except (TypeError, ValueError):
             continue
+
         if q_num not in question_map:
-            # Question found in answer pages but not in marks grid — add it
             q = Question(
                 submission_id=submission.id,
                 question_number=q_num,
@@ -108,27 +150,39 @@ def _run(submission: Submission, pdf_path: str, db: Session):
             question_map[q_num] = q
 
         q = question_map[q_num]
-        if q.answer_text is None:
-            q.answer_text = seg.get("answer_text", "")
-        else:
-            # Multi-page: append continuation
-            q.answer_text += "\n" + seg.get("answer_text", "")
+        q.answer_text = (q.answer_text or "") + (
+            "\n" + seg.get("answer_text", "") if q.answer_text else seg.get("answer_text", "")
+        )
 
-        loc = QuestionLocation(
+        bbox = seg.get("bbox", [0, 0, 1, 1])
+        db.add(QuestionLocation(
             question_id=q.id,
             page_number=seg["page"],
             page_image_path=seg["image_path"],
-            bbox_x1=seg["bbox"][0],
-            bbox_y1=seg["bbox"][1],
-            bbox_x2=seg["bbox"][2],
-            bbox_y2=seg["bbox"][3],
+            bbox_x1=bbox[0],
+            bbox_y1=bbox[1],
+            bbox_x2=bbox[2],
+            bbox_y2=bbox[3],
             sequence=seg.get("sequence", 0),
-        )
-        db.add(loc)
+        ))
 
-    db.flush()
+    db.commit()
+    print("[pipeline] phase 2 done — all segments stored")
 
-    # --- Phase 5: analysis ---
+
+# ── Phase 3: analysis ─────────────────────────────────────────────────────────
+
+def _phase3_analysis(submission: Submission, db: Session):
+    """
+    Run strengths/weaknesses analysis over all transcribed questions.
+    SKIP if analysis already exists for this submission (resume).
+    """
+    if db.query(Analysis).filter_by(submission_id=submission.id).count() > 0:
+        print("[pipeline] phase 3 already done — skipping")
+        return
+
+    print("[pipeline] phase 3: running analysis")
+    questions = db.query(Question).filter_by(submission_id=submission.id).all()
     q_dicts = [
         {
             "question_number": q.question_number,
@@ -136,18 +190,22 @@ def _run(submission: Submission, pdf_path: str, db: Session):
             "max_marks": q.max_marks,
             "answer_text": q.answer_text,
         }
-        for q in question_map.values()
+        for q in questions
     ]
+
     analysis_data = analyse_submission(q_dicts)
 
     # Write topic back onto each question
-    q_topics: dict = analysis_data.get("question_topics", {})
-    for q_num_str, topic in q_topics.items():
-        q_num = int(q_num_str)
-        if q_num in question_map:
-            question_map[q_num].topic = topic
+    for q_num_str, topic in analysis_data.get("question_topics", {}).items():
+        try:
+            q_num = int(q_num_str)
+            q = next((q for q in questions if q.question_number == q_num), None)
+            if q:
+                q.topic = topic
+        except (TypeError, ValueError):
+            pass
 
-    analysis = Analysis(
+    db.add(Analysis(
         submission_id=submission.id,
         overall_percentage=analysis_data.get("overall_percentage"),
         strengths=json.dumps(analysis_data.get("strengths", [])),
@@ -155,18 +213,14 @@ def _run(submission: Submission, pdf_path: str, db: Session):
         error_patterns=json.dumps(analysis_data.get("error_patterns", [])),
         recommendations=json.dumps(analysis_data.get("recommendations", [])),
         topic_performance=json.dumps(analysis_data.get("topic_performance", {})),
-    )
-    db.add(analysis)
+    ))
+    db.commit()
+    print("[pipeline] phase 3 done — analysis stored")
 
 
-def _resolve_continuations(
-    segments: list[dict], image_paths: list[str]
-) -> list[dict]:
-    """
-    Assign sequence numbers and resolve continuation segments.
-    A continuation gets the same question_id as the last non-continuation segment.
-    Falls back to check_page_boundary when ambiguous.
-    """
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _resolve_continuations(segments: list[dict]) -> list[dict]:
     resolved = []
     last_q_id: int | None = None
     q_sequence: dict[int, int] = {}
@@ -175,23 +229,23 @@ def _resolve_continuations(
         if seg.get("is_continuation") and last_q_id is not None:
             seg["question_id"] = last_q_id
         else:
-            last_q_id = seg["question_id"]
+            last_q_id = seg.get("question_id")
 
-        q_id = seg["question_id"]
-        seq = q_sequence.get(q_id, 0)
-        seg["sequence"] = seq
-        q_sequence[q_id] = seq + 1
+        q_id = seg.get("question_id")
+        if q_id is not None:
+            seq = q_sequence.get(q_id, 0)
+            seg["sequence"] = seq
+            q_sequence[q_id] = seq + 1
         resolved.append(seg)
 
     return resolved
 
 
-# Class 12 CBSE mark scheme (approximate)
 _MARK_SCHEME = {
-    **{i: 1 for i in range(1, 21)},   # Q1–Q20: 1 mark each
-    **{i: 2 for i in range(21, 26)},  # Q21–Q25: 2 marks each
-    **{i: 3 for i in range(26, 29)},  # Q26–Q28: 3 marks each (case-based / SA)
-    **{i: 5 for i in range(29, 37)},  # Q29–Q36: 5 marks each (long answer)
+    **{i: 1 for i in range(1, 21)},
+    **{i: 2 for i in range(21, 26)},
+    **{i: 3 for i in range(26, 29)},
+    **{i: 5 for i in range(29, 37)},
 }
 
 
