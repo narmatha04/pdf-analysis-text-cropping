@@ -37,7 +37,7 @@ def run_pipeline(submission_id: str, pdf_path: str):
 
 def _run(submission: Submission, pdf_path: str, db: Session):
     pages_dir = STORAGE / "pages" / submission.id
-    image_paths = pdf_to_images(pdf_path, str(pages_dir), dpi=200)
+    image_paths = pdf_to_images(pdf_path, str(pages_dir), dpi=150)
 
     # --- Phase 1: marks grid from page 1 ---
     marks_data = extract_marks_grid(image_paths[0])
@@ -69,11 +69,16 @@ def _run(submission: Submission, pdf_path: str, db: Session):
     all_segments: list[dict] = []  # {page, question_id, bbox, answer_text, is_continuation}
 
     for page_idx, img_path in enumerate(image_paths[1:], start=2):
-        segments = segment_page(img_path, page_idx)
+        try:
+            segments = segment_page(img_path, page_idx)
+        except Exception as e:
+            print(f"[pipeline] page {page_idx} segmentation failed: {e} — skipping")
+            segments = []
         for seg in segments:
             seg["page"] = page_idx
             seg["image_path"] = img_path
         all_segments.extend(segments)
+        print(f"[pipeline] page {page_idx} done — {len(segments)} questions found")
 
     # --- Phase 3: resolve multi-page continuations ---
     # If VLM flagged is_continuation=true on a segment, check the boundary

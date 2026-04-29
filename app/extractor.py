@@ -6,9 +6,13 @@ import re
 from pathlib import Path
 
 from google import genai
+from google.genai import types
 from PIL import Image
 
-client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+client = genai.Client(
+    api_key=os.environ["GEMINI_API_KEY"],
+    http_options=types.HttpOptions(timeout=60000),  # 60s timeout per call
+)
 
 _MODEL = "models/gemini-2.5-flash"
 
